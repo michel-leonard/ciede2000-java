@@ -1,0 +1,96 @@
+name: CIEDE2000 Test in Java
+
+on:
+  workflow_dispatch:
+
+env:
+  n_csv_lines: 10000000
+
+jobs:
+  test-implementation-de00-java:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 📂 For each step below, a new shell will be started at the repository root
+        uses: actions/checkout@v7
+
+      - name: 📦 Set up Java and GCC
+        run: |
+          command -v javac > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes default-jdk ; }
+          command -v gcc > /dev/null || { sudo apt-get update --allow-unauthenticated && sudo apt-get install --allow-unauthenticated --no-install-recommends --assume-yes gcc ; }
+
+      - name: 🔧 Create Java Driver
+        run: |
+          cat << 'EOF' > TestDriver.java
+          import java.io.BufferedReader;
+          import java.io.BufferedWriter;
+          import java.io.FileReader;
+          import java.io.FileWriter;
+          public class TestDriver {
+          EOF
+          cat ciede2000.java >> TestDriver.java
+          cat << 'EOF' >> TestDriver.java
+              public static void main(String[] args) throws Exception {
+                  try (BufferedReader br = new BufferedReader(new FileReader(args[0]), 65536);
+                      BufferedWriter bw = new BufferedWriter(new FileWriter(args[1]), 65536)) {
+                      String line;
+                      final boolean canonical = args.length > 2;
+                      while ((line = br.readLine()) != null) {
+                          final String[] p = line.split(",");
+                          final double res = ciede2000_with_parameters(
+                               Double.parseDouble(p[0]), Double.parseDouble(p[1]), Double.parseDouble(p[2]),
+                               Double.parseDouble(p[3]), Double.parseDouble(p[4]), Double.parseDouble(p[5]),
+                               Double.parseDouble(p[6]), Double.parseDouble(p[7]), Double.parseDouble(p[8]),
+                               canonical
+                          );
+                          bw.write(line + "," + res + "\n");
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: 🌐 Download the CIEDE2000 driver program
+        run: wget --no-verbose --no-check-certificate --timeout=5 --tries=2 https://ciede2000.pages-perso.free.fr/static/github/ciede2000-native-precision-driver.c
+
+      - name: ⚙️ Compile the C driver & Java code
+        run: |
+          gcc --version && gcc -std=c99 -Wall -pedantic -O2 -g ciede2000-native-precision-driver.c -o ciede2000-native -lm
+          java -version && javac TestDriver.java
+
+      - name: 🎨 Generate ΔE2000 color difference test cases
+        run: ./ciede2000-native --number $n_csv_lines --with-weights --output-file test-cases.csv
+
+      - name: 🚀 Run test cases in Java and submit them to the verifier
+        run: |
+          java -Xmx128m TestDriver test-cases.csv calc-canonical.csv --canonical &
+          java -Xmx128m TestDriver test-cases.csv calc-simplified.csv &
+          wait
+          ./ciede2000-native -i calc-canonical.csv -o summary-canonical.txt &
+          ./ciede2000-native -i calc-simplified.csv -o summary-simplified.txt &
+          wait
+          echo "Temporary File Details:"
+          du -h calc-*
+          wc -l calc-*
+          rm calc-*
+
+      - name: 🏁 Conclusion
+        run: |
+          for compliance in simplified canonical; do
+            file="summary-$compliance.txt"
+            cat "$file"
+            
+            if [ "${file%canonical.txt}" = "$file" ]; then
+              Q1="[ ] CANONICAL [X] SIMPLIFIED"
+            else
+              Q1="[X] CANONICAL [ ] SIMPLIFIED"
+            fi
+            
+            if grep -Fq "$Q1" "$file" && grep -Fq "Error : 0" "$file" && grep -Fq "Successes : $n_csv_lines" "$file"; then
+              echo "✔️ Verification of $file successful: all $n_csv_lines color differences were correctly calculated."
+            else
+              echo "❌ Verification failed. See above for details."
+              exit 1
+            fi
+          done
